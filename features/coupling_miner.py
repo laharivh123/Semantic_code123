@@ -1,8 +1,14 @@
 """
-Git history logical coupling analysis.
+Git-history logical coupling analysis.
 
-The Streamlit app clones a GitHub repository first and passes the
-local clone path to mine_logical_coupling().
+Repository-level logical coupling:
+    (commits changing two or more relevant files / analyzed commits) * 100
+
+File-pair co-change frequency is reported separately:
+    (commits changing both files / analyzed commits) * 100
+
+The pair frequency is deliberately NOT normalized by the less frequently
+changed file, because that normalization can make many pairs appear as 100%.
 """
 
 from itertools import combinations
@@ -27,7 +33,7 @@ IGNORED_SUFFIXES = {
 
 
 def _is_relevant_file(path):
-    """Exclude generated/cache/binary artifacts from source-history mining."""
+    """Exclude generated, cache, and binary artifacts from history mining."""
     normalized = Path(path).as_posix()
     parts = [part.lower() for part in Path(normalized).parts]
 
@@ -45,276 +51,185 @@ def _is_relevant_file(path):
     return True
 
 
+def _coupling_classification(score):
+    """Return the project's descriptive interpretation band."""
+    if score <= 30:
+        return "Loose"
+    if score <= 60:
+        return "Moderate"
+    return "Tight"
+
+
 def mine_logical_coupling(repo_path, min_commits=2):
     """
-    Analyze a Git repository's history and find files that are
-    frequently changed together.
+    Mine co-change evidence from a local Git repository.
 
-    Parameters
-    ----------
-    repo_path : str
-        Local path to a Git repository.
+    A commit is considered multi-file when it changes at least two distinct
+    relevant repository files. The repository-level percentage uses the
+    number of analyzed non-root commits as its denominator.
 
-    min_commits : int
-        Minimum number of commits in which two files must be changed
-        together before they are considered logically coupled.
+    Args:
+        repo_path: Local path to a Git working copy.
+        min_commits: Minimum shared-commit count for a file pair to be listed.
 
-    Returns
-    -------
-    dict
-        Contains:
-        - commits_analyzed
-        - files_analyzed
-        - couplings
-        - ignored_root_commit: whether the initial baseline commit was excluded
-        - ignored_artifact_paths: generated/binary paths excluded from analysis
+    Returns:
+        A dictionary containing repository-level coupling, pair-level
+        co-change frequency, commit evidence, and per-file counts.
     """
-
-    # ---------------------------------------------------------
-    # Convert repository path to an absolute Path
-    # ---------------------------------------------------------
-
     repo_path = Path(repo_path).resolve()
-
-    # ---------------------------------------------------------
-    # Open Git repository
-    # ---------------------------------------------------------
 
     try:
         repo = Repo(str(repo_path))
-
     except (InvalidGitRepositoryError, NoSuchPathError) as exc:
-        raise ValueError(
-            f"Not a valid Git repository: {repo_path}"
-        ) from exc
+        raise ValueError(f"Not a valid Git repository: {repo_path}") from exc
 
     if repo.bare:
-        raise ValueError(
-            "The Git repository is bare."
-        )
-
-    # ---------------------------------------------------------
-    # Data structures
-    # ---------------------------------------------------------
+        raise ValueError("The Git repository is bare.")
 
     pair_counts = {}
-
     file_commit_counts = {}
-
+    file_multi_module_counts = {}
     all_files = set()
-
+    multi_module_commits = []
     commits_analyzed = 0
     ignored_artifact_paths = set()
     ignored_root_commit = False
 
     for commit in repo.iter_commits():
-
-        changed_files = set()
-
-        try:
-            # -------------------------------------------------
-            # Ignore the root commit: it establishes the initial
-            # baseline rather than recording a meaningful change
-            # between two versions. Counting every baseline file
-            # as co-changed creates artificial coupling.
-            # -------------------------------------------------
-
-            if not commit.parents:
-                ignored_root_commit = True
-                continue
-
-            # -------------------------------------------------
-            # Normal commit
-            # -------------------------------------------------
-
-            if commit.parents:
-
-                parent = commit.parents[0]
-
-                for diff in parent.diff(
-                    commit,
-                    create_patch=False
-                ):
-
-                    # File before the change
-                    if diff.a_path:
-                        if _is_relevant_file(diff.a_path):
-                            changed_files.add(Path(diff.a_path).as_posix())
-                        else:
-                            ignored_artifact_paths.add(Path(diff.a_path).as_posix())
-
-                    # File after the change
-                    if diff.b_path:
-                        if _is_relevant_file(diff.b_path):
-                            changed_files.add(Path(diff.b_path).as_posix())
-                        else:
-                            ignored_artifact_paths.add(Path(diff.b_path).as_posix())
-
-        except Exception:
-            # Skip commits that cannot be processed.
+        # A root commit establishes the baseline; it is not counted as a
+        # change between two versions.
+        if not commit.parents:
+            ignored_root_commit = True
             continue
 
-        # -----------------------------------------------------
-        # Ignore commits without changed files
-        # -----------------------------------------------------
+        changed_files = set()
+        try:
+            # Compare against the first parent, matching the existing
+            # first-parent treatment of merge commits.
+            for diff in commit.parents[0].diff(commit, create_patch=False):
+                for changed_path in (diff.a_path, diff.b_path):
+                    if not changed_path:
+                        continue
+
+                    normalized = Path(changed_path).as_posix()
+                    if _is_relevant_file(normalized):
+                        changed_files.add(normalized)
+                    else:
+                        ignored_artifact_paths.add(normalized)
+        except Exception:
+            # Do not count a commit if its changed-file evidence could not
+            # be read reliably.
+            continue
 
         if not changed_files:
             continue
 
         commits_analyzed += 1
-
-        # Add files to overall file set
-        all_files.update(
-            changed_files
-        )
-
-        # -----------------------------------------------------
-        # Count how many commits changed each file
-        # -----------------------------------------------------
+        all_files.update(changed_files)
 
         for file_path in changed_files:
-
             file_commit_counts[file_path] = (
-                file_commit_counts.get(
-                    file_path,
-                    0
-                ) + 1
+                file_commit_counts.get(file_path, 0) + 1
             )
 
-        # -----------------------------------------------------
-        # Count file pairs changed in the same commit
-        # -----------------------------------------------------
+        # Count each commit that changes at least two relevant files once.
+        if len(changed_files) >= 2:
+            ordered_files = sorted(changed_files)
+            commit_date = commit.committed_datetime.isoformat()
 
-        for file_a, file_b in combinations(
-            sorted(changed_files),
-            2
-        ):
+            multi_module_commits.append({
+                "commit_hash": commit.hexsha,
+                "short_hash": commit.hexsha[:7],
+                "date": commit_date,
+                "message": commit.summary,
+                "changed_file_count": len(ordered_files),
+                "changed_files": ordered_files,
+            })
 
-            pair = (
-                file_a,
-                file_b
-            )
+            for file_path in ordered_files:
+                file_multi_module_counts[file_path] = (
+                    file_multi_module_counts.get(file_path, 0) + 1
+                )
 
-            pair_counts[pair] = (
-                pair_counts.get(
-                    pair,
-                    0
-                ) + 1
-            )
+        # Count every pair that changed in the same commit.
+        for file_a, file_b in combinations(sorted(changed_files), 2):
+            pair = (file_a, file_b)
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
 
-    # ---------------------------------------------------------
-    # Calculate logical coupling
-    # ---------------------------------------------------------
+    multi_module_commit_count = len(multi_module_commits)
+    logical_coupling_percent = (
+        (multi_module_commit_count / commits_analyzed) * 100
+        if commits_analyzed
+        else 0.0
+    )
+    logical_coupling_percent = round(logical_coupling_percent, 2)
+    logical_coupling_label = _coupling_classification(
+        logical_coupling_percent
+    )
 
     couplings = []
-
-    for (
-        file_a,
-        file_b
-    ), co_change_count in pair_counts.items():
-
-        # Only consider pairs changed together at least
-        # min_commits times.
+    for (file_a, file_b), co_change_count in pair_counts.items():
         if co_change_count < min_commits:
             continue
 
-        file_a_commits = file_commit_counts.get(
-            file_a,
-            0
+        file_a_commits = file_commit_counts.get(file_a, 0)
+        file_b_commits = file_commit_counts.get(file_b, 0)
+
+        # This answers: what percentage of all analyzed commits changed
+        # this pair together? It is not the repository-level LC metric.
+        pair_frequency = (
+            (co_change_count / commits_analyzed) * 100
+            if commits_analyzed
+            else 0.0
         )
 
-        file_b_commits = file_commit_counts.get(
-            file_b,
-            0
-        )
-
-        # Use the less frequently changed file as denominator.
-        denominator = min(
-            file_a_commits,
-            file_b_commits
-        )
-
-        if denominator == 0:
-            continue
-
-        # -----------------------------------------------------
-        # Coupling score
-        # -----------------------------------------------------
-        #
-        # Example:
-        #
-        # analyzer.py changed in 3 commits
-        # parser.py changed in 3 commits
-        # changed together in 3 commits
-        #
-        # score = 3 / 3 * 100 = 100%
-        # -----------------------------------------------------
-
-        coupling_score = (
-            co_change_count
-            / denominator
-        ) * 100
-
-        coupling_score = min(
-            coupling_score,
-            100.0
-        )
-
-        couplings.append(
-            {
-                "file_a": file_a,
-
-                "file_b": file_b,
-
-                "coupling_score": round(
-                    coupling_score,
-                    1
-                ),
-
-                "co_change_count": (
-                    co_change_count
-                ),
-
-                "file_a_commits": (
-                    file_a_commits
-                ),
-
-                "file_b_commits": (
-                    file_b_commits
-                ),
-
-                "reference_frequency": (
-                    denominator
-                ),
-            }
-        )
-
-    # ---------------------------------------------------------
-    # Sort strongest relationships first
-    # ---------------------------------------------------------
+        couplings.append({
+            "file_a": file_a,
+            "file_b": file_b,
+            "coupling_score": round(pair_frequency, 2),
+            "repository_cochange_percent": round(pair_frequency, 2),
+            "co_change_count": co_change_count,
+            "file_a_commits": file_a_commits,
+            "file_b_commits": file_b_commits,
+            "reference_frequency": min(file_a_commits, file_b_commits),
+        })
 
     couplings.sort(
         key=lambda item: (
-            item["coupling_score"],
-            item["co_change_count"]
+            item["co_change_count"],
+            item["repository_cochange_percent"],
         ),
-        reverse=True
+        reverse=True,
     )
 
-    # ---------------------------------------------------------
-    # Return results to Streamlit
-    # ---------------------------------------------------------
+    file_multi_module_rows = [
+        {
+            "file": file_path,
+            "multi_file_commits": count,
+            "total_commits_affecting_file": file_commit_counts.get(file_path, 0),
+        }
+        for file_path, count in file_multi_module_counts.items()
+    ]
+    file_multi_module_rows.sort(
+        key=lambda item: (item["multi_file_commits"], item["file"]),
+        reverse=True,
+    )
 
     return {
-        "commits_analyzed": (
-            commits_analyzed
-        ),
-
-        "files_analyzed": (
-            len(all_files)
-        ),
-
+        "commits_analyzed": commits_analyzed,
+        "files_analyzed": len(all_files),
+        "multi_module_commit_count": multi_module_commit_count,
+        "logical_coupling_percent": logical_coupling_percent,
+        "logical_coupling_label": logical_coupling_label,
+        "multi_module_commits": multi_module_commits,
+        "file_multi_module_counts": file_multi_module_rows,
         "couplings": couplings,
         "ignored_root_commit": ignored_root_commit,
         "ignored_artifact_paths": len(ignored_artifact_paths),
+        "formula": (
+            "multi_module_commit_count / commits_analyzed * 100"
+        ),
+        "pair_frequency_formula": (
+            "co_change_count / commits_analyzed * 100"
+        ),
     }
