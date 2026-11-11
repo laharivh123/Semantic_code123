@@ -4074,107 +4074,94 @@ if page == "🧩 Module Boundaries":
 
 # ============================================================
 # PAGE 9 — LOGICAL COUPLING
-# ============================================================
 
 if page == "🔀 Logical Coupling":
 
-    st.header(
-        "🔀 Architectural Logical Coupling"
-    )
+    st.header("🔀 Architectural Logical Coupling")
 
     st.write(
         """
         Detect files that repeatedly change together in Git history.
-        This can reveal hidden architectural relationships that are
-        not visible from direct dependencies alone.
+        The repository-level percentage measures how many analyzed commits
+        changed two or more relevant files. File-pair co-change frequency
+        is displayed separately.
         """
     )
 
     if not COUPLING_AVAILABLE:
-
-        st.error(
-            "coupling_miner.py is not available."
-        )
-
+        st.error("coupling_miner.py is not available.")
     else:
-
         target = get_current_repository_path()
 
         if not target:
-
             st.warning(
-                "Load a repository from the "
-                "**📂 Repository Input** page first."
+                "Load a repository from the **📂 Repository Input** page first."
             )
-
         elif not git_repository_available():
-
             st.warning(
                 "Logical coupling requires Git history. "
-                "Load a Git repository containing `.git` history."
+                "Load a Git repository containing its .git history."
             )
-
         else:
+            st.caption(f"Repository: `{target}`")
 
-            st.caption(
-                f"Repository: `{target}`"
-            )
-
-            if st.button(
-                "Analyze Logical Coupling",
-                type="primary",
-            ):
-
+            if st.button("Analyze Logical Coupling", type="primary"):
                 try:
+                    result = mine_logical_coupling(target)
 
-                    result = mine_logical_coupling(
-                        target
+                    commits_analyzed = result.get("commits_analyzed", 0)
+                    files_analyzed = result.get("files_analyzed", 0)
+                    multi_count = result.get("multi_module_commit_count", 0)
+                    overall_score = result.get("logical_coupling_percent", 0.0)
+                    overall_label = result.get("logical_coupling_label", "Unavailable")
+
+                    metric_cols = st.columns(4)
+                    metric_cols[0].metric("Commits Analyzed", commits_analyzed)
+                    metric_cols[1].metric("Files Analyzed", files_analyzed)
+                    metric_cols[2].metric("Multi-file Commits", multi_count)
+                    metric_cols[3].metric("Repository Logical Coupling", f"{overall_score:.2f}%")
+
+                    st.subheader("Repository-Level Logical Coupling")
+                    st.markdown(
+                        r"\(LC(\%) = \frac{\text{Commits affecting 2 or more files}}"
+                        r"{\text{Total commits analyzed}} \times 100\)"
+                    )
+                    st.write(
+                        f"**Calculation:** {multi_count} / {commits_analyzed} × 100 "
+                        f"= **{overall_score:.2f}%**"
+                        if commits_analyzed
+                        else "No eligible commits were found for calculation."
                     )
 
-                    c1, c2 = st.columns(2)
-
-                    c1.metric(
-                        "Commits Analyzed",
-                        result.get(
-                            "commits_analyzed",
-                            0,
-                        ),
-                    )
-
-                    c2.metric(
-                        "Files Analyzed",
-                        result.get(
-                            "files_analyzed",
-                            0,
-                        ),
-                    )
-
-                    couplings = result.get(
-                        "couplings",
-                        [],
-                    )
-
-                    if not couplings:
-
-                        st.info(
-                            "No significant logical coupling detected."
-                        )
-
+                    if overall_label == "Loose":
+                        st.info(f"Interpretation: **{overall_label} coupling** (0–30%).")
+                    elif overall_label == "Moderate":
+                        st.warning(f"Interpretation: **{overall_label} coupling** (above 30–60%).")
                     else:
+                        st.error(f"Interpretation: **{overall_label} coupling** (above 60–100%).")
 
-                        # Show the individual file frequencies and shared
-                        # change count used by the reference-table formula.
+                    st.caption(
+                        "Interpretation bands are project-level descriptive thresholds, "
+                        "not universal software-engineering standards. A file is treated "
+                        "as a module unit for this calculation."
+                    )
+
+                    st.divider()
+                    st.subheader("File Pairs That Changed Together")
+
+                    couplings = result.get("couplings", [])
+                    if couplings:
                         coupling_rows = []
-
                         for item in couplings[:100]:
                             coupling_rows.append({
                                 "File A": item.get("file_a", "Unknown"),
                                 "File B": item.get("file_b", "Unknown"),
-                                "F_A (commits)": item.get("file_a_commits", 0),
-                                "F_B (commits)": item.get("file_b_commits", 0),
-                                "CC(A,B) (co-change commits)": item.get("co_change_count", 0),
-                                "min(F_A,F_B)": item.get("reference_frequency", 0),
-                                "Logical coupling (%)": item.get("coupling_score", 0),
+                                "Commits Affecting A": item.get("file_a_commits", 0),
+                                "Commits Affecting B": item.get("file_b_commits", 0),
+                                "Changed Together": item.get("co_change_count", 0),
+                                "Share of All Analyzed Commits (%)": item.get(
+                                    "repository_cochange_percent", 0
+                                ),
                             })
 
                         st.dataframe(
@@ -4182,24 +4169,72 @@ if page == "🔀 Logical Coupling":
                             use_container_width=True,
                             hide_index=True,
                         )
-
                         st.caption(
-                            "LC(A, B) = CC(A, B) / min(F_A, F_B) × 100. "
-                            "F_A and F_B count commits changing each file; "
-                            "CC(A, B) counts commits changing both files. "
-                            "A score of 100% means the less-frequently changed "
-                            "file changed together with the other file in every "
-                            "commit in which it changed."
+                            "Pair frequency = commits changing both files / all analyzed "
+                            "commits × 100. This is a pair-specific frequency, not the "
+                            "repository-level logical-coupling percentage."
+                        )
+                    else:
+                        st.info(
+                            "No file pairs met the minimum co-change frequency. "
+                            "The repository-level result above is still valid."
+                        )
+
+                    st.divider()
+                    st.subheader("Commits Affecting Multiple Files")
+                    multi_commits = result.get("multi_module_commits", [])
+
+                    if multi_commits:
+                        commit_rows = [
+                            {
+                                "Commit": item.get("short_hash", ""),
+                                "Date": item.get("date", ""),
+                                "Message": item.get("message", ""),
+                                "Files Changed": item.get("changed_file_count", 0),
+                                "Changed Files": ", ".join(item.get("changed_files", [])),
+                            }
+                            for item in multi_commits
+                        ]
+                        st.dataframe(
+                            commit_rows,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.info("No commits changed two or more relevant files.")
+
+                    st.divider()
+                    st.subheader("Per-File Multi-File Commit Counts")
+                    file_counts = result.get("file_multi_module_counts", [])
+
+                    if file_counts:
+                        st.dataframe(
+                            file_counts,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.info("No files were part of a multi-file commit.")
+
+                    with st.expander("Analysis details and exclusions"):
+                        st.write(
+                            f"Root commit excluded as baseline: "
+                            f"{'Yes' if result.get('ignored_root_commit') else 'No'}"
+                        )
+                        st.write(
+                            "Ignored generated/binary artifact paths: "
+                            f"{result.get('ignored_artifact_paths', 0)}"
+                        )
+                        st.write(
+                            "Only commits with at least one relevant changed file "
+                            "are included in the denominator. The first parent is "
+                            "used when examining merge commits."
                         )
 
                 except Exception as e:
-
-                    st.error(
-                        f"Logical coupling analysis failed: {e}"
-                    )
+                    st.error(f"Logical coupling analysis failed: {e}")
 
 
-# ============================================================
 # PAGE 10 — ARCHITECTURE RISK
 # ============================================================
 
